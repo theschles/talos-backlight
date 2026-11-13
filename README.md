@@ -101,10 +101,9 @@ Select your Kubernetes and Talos contexts using the ordinary tool configuration 
 export BACKLIGHT_KUBE_CONTEXT=YOUR_KUBERNETES_CONTEXT
 export BACKLIGHT_TALOS_CONTEXT=YOUR_TALOS_CONTEXT
 export TALOSCONFIG=/path/to/your/talosconfig
-export TALOS_ENDPOINT=192.0.2.10
 ```
 
-`kubectl` and `talosctl` use their current contexts when the corresponding overrides are omitted. `--endpoint` or `TALOS_ENDPOINT` is required. Both commands accept `--inventory`, `--kube-context`, and `--namespace`. Deployment also accepts `--talosconfig` and `--talos-context`.
+`kubectl` and `talosctl` use their current contexts when the corresponding overrides are omitted. With no endpoint override, `talosctl` uses the endpoints saved in the selected Talos context. Run `talosctl config info` to check the active context and endpoints. Use `--endpoint` to override them, or export `CONTROL_PLANE_IP` as in the Talos setup guides. The legacy `TALOS_ENDPOINT` variable is also accepted. Precedence is `--endpoint`, `CONTROL_PLANE_IP`, `TALOS_ENDPOINT`, then the Talos context. Use an absolute path for `TALOSCONFIG` so it works from other checkouts. Both commands accept `--inventory`, `--kube-context`, and `--namespace`. Deployment also accepts `--talosconfig` and `--talos-context`.
 
 ```sh
 ./deploy-backlight > preview.json
@@ -119,7 +118,22 @@ Preview reads the cluster and Talos configuration, detects interfaces, and print
 4. Label verified inventory nodes with `backlight-class` and `backlight.talos.dev/enrollment`, then reconcile the class DaemonSets and shared configuration. The enrollment label binds scheduling to the verified node identity. Rerun deployment to enroll a replacement node.
 5. Wait for each DaemonSet rollout, then verify manual status, the authenticated event subscription, and restoration readiness on every inventory node.
 
-Talos applies its role allowlist to every permitted namespace. Deployment refuses a cluster-wide grant containing roles beyond `os:reader` and refuses to add that role when doing so would activate grants for other namespaces. Existing namespaces must have `backlight.talos.dev/managed=true` and already enforce the privileged Pod Security profile. For an older installation, verify that the namespace is dedicated to backlight and restrict workload creation there before marking it as managed. The deploy script does not change the Pod Security level of an existing namespace.
+Talos applies its role allowlist to every permitted namespace. Deployment refuses a cluster-wide grant containing roles beyond `os:reader` and refuses to add that role when doing so would activate grants for other namespaces. Existing namespaces must have `backlight.talos.dev/managed=true` and already enforce the privileged Pod Security profile. For an older installation, verify that the namespace is dedicated to backlight and restrict workload creation there before marking it as managed. Inspect the existing namespace and confirm the Kubernetes context first.
+
+```sh
+kubectl config current-context
+kubectl get namespace backlight-system --show-labels
+kubectl -n backlight-system get daemonsets,deployments,statefulsets,jobs,cronjobs,pods
+```
+
+If the namespace is dedicated to backlight, already enforces privileged Pod Security, and only trusted administrators can create workloads there, explicitly approve adoption. Preview reports what would happen and leaves the existing namespace out of the rendered manifest. Apply rechecks eligibility and adds the ownership label before continuing deployment.
+
+```sh
+./deploy-backlight --adopt-namespace > preview.json
+./deploy-backlight --apply --adopt-namespace
+```
+
+If the namespace is shared or enforces a stricter policy, choose a new dedicated namespace with `--namespace`. The same namespace option is available on `./backlight`.
 
 Talos v1.14.2 issues six-hour service account certificates and renews them automatically. The listener reads the latest mounted credential when reconnecting. After a cluster has been off past expiration, renewal occurs as the control plane recovers. Verify connection logs before relying on shutdown restoration.
 

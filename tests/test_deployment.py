@@ -41,9 +41,61 @@ class DeploymentTest(unittest.TestCase):
                     )
                 },
             ),
-            self.assertRaisesRegex(ValueError, "not a managed"),
+            self.assertRaisesRegex(ValueError, "not owned.*--adopt-namespace"),
         ):
-            self.module["namespace_exists"](["kubectl"], "shared")
+            self.module["inspect_namespace"](["kubectl"], "shared", adopt=False)
+
+    def test_adoption_checks_workloads_and_patches_only_ownership(self) -> None:
+        namespace = {
+            "metadata": {
+                "name": "backlight-system",
+                "uid": "fixture",
+                "resourceVersion": "42",
+                "labels": {"pod-security.kubernetes.io/enforce": "privileged"},
+            }
+        }
+        workloads = [
+            {"kind": "DaemonSet", "metadata": {"name": "gmux-backlight", "uid": "gmux"}},
+            {
+                "kind": "Pod",
+                "metadata": {
+                    "name": "panel",
+                    "ownerReferences": [
+                        {"kind": "DaemonSet", "uid": "gmux", "controller": True},
+                    ],
+                },
+            },
+        ]
+        for unrelated in (False, True):
+            with self.subTest(unrelated=unrelated):
+                items = workloads + (
+                    [{"kind": "Job", "metadata": {"name": "other"}}] if unrelated else []
+                )
+                command = Mock(return_value=json.dumps({"items": items}))
+                with patch.dict(
+                    self.scope, {"get_object": Mock(return_value=namespace), "run": command}
+                ):
+                    if unrelated:
+                        with self.assertRaisesRegex(ValueError, "unrelated Job"):
+                            self.module["reconcile_namespace"](
+                                ["kubectl"], namespace, namespace, adopt=True
+                            )
+                        self.assertEqual(command.call_count, 1)
+                    else:
+                        self.module["reconcile_namespace"](
+                            ["kubectl"], namespace, namespace, adopt=True
+                        )
+                        self.assertEqual(command.call_count, 2)
+                        self.assertEqual(
+                            json.loads(command.call_args.args[0][-1]),
+                            {
+                                "metadata": {
+                                    "uid": "fixture",
+                                    "resourceVersion": "42",
+                                    "labels": {"backlight.talos.dev/managed": "true"},
+                                }
+                            },
+                        )
 
     def test_mirror_replacement_deletes_before_restoring(self) -> None:
         previous = {

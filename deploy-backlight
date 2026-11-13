@@ -151,9 +151,13 @@ def stage_images(args: argparse.Namespace, pending: list[ImageTarget]) -> None:
         return
     if not args.archive.is_file():
         raise ValueError(f"missing image archive {args.archive}")
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
-        route.connect((args.endpoint, 50000))
-        address = args.registry_address or route.getsockname()[0]
+    address = args.registry_address
+    if not address:
+        # Use the route to the first cache target to find the workstation address.
+        target_ip = pending[0][0][-1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect((target_ip, 50000))
+            address = route.getsockname()[0]
     with tempfile.TemporaryDirectory(prefix="backlight-cache-") as temporary:
         cache = Path(temporary) / "cache"
         repository = args.image.split("/", 1)[1].split("@", 1)[0]
@@ -285,19 +289,87 @@ def get_object(
     return json.loads(raw) if raw.strip() else None
 
 
-def namespace_exists(kube: list[str], namespace: str) -> bool:
-    """Refuse to adopt a namespace or weaken its existing admission policy."""
+def inspect_namespace(kube: list[str], namespace: str, *, adopt: bool) -> JSONObject | None:
+    """Read the namespace and validate eligibility for deployment or adoption."""
     existing = get_object(kube, "namespace", namespace)
     if existing is None:
-        return False
-    labels = existing["metadata"].get("labels", {})
-    if labels.get(NAMESPACE_OWNER) != "true" or labels.get(POD_SECURITY) != "privileged":
+        return None
+    metadata = existing["metadata"]
+    if metadata.get("deletionTimestamp"):
+        raise ValueError(f"namespace {namespace!r} is terminating")
+    labels = metadata.get("labels", {})
+    if labels.get(NAMESPACE_OWNER) != "true" and not adopt:
         raise ValueError(
-            f"namespace {namespace} is not a managed, dedicated privileged backlight namespace"
+            f"namespace {namespace!r} is not owned by this tool. "
+            "Use --adopt-namespace to preview adoption, or --apply --adopt-namespace to adopt it."
         )
-    if existing["metadata"].get("deletionTimestamp"):
-        raise ValueError(f"namespace {namespace} is terminating")
-    return True
+    if labels.get(POD_SECURITY) != "privileged":
+        raise ValueError(
+            f"namespace {namespace!r} must already have {POD_SECURITY}=privileged; "
+            "choose a dedicated namespace or review its policy separately."
+        )
+    if labels.get(NAMESPACE_OWNER) != "true":
+        workloads = json.loads(
+            run(
+                kube
+                + [
+                    "-n",
+                    namespace,
+                    "get",
+                    "daemonsets,deployments,statefulsets,replicasets,replicationcontrollers,jobs,cronjobs,pods",
+                    "-o",
+                    "json",
+                ]
+            )
+        )["items"]
+        controllers = {
+            obj["metadata"]["uid"]
+            for obj in workloads
+            if obj["kind"] == "DaemonSet"
+            and obj["metadata"]["name"] in {"gmux-backlight", "dell-backlight"}
+        }
+        for obj in workloads:
+            kind = obj["kind"]
+            meta = obj["metadata"]
+            if kind == "DaemonSet" and meta.get("uid") in controllers:
+                continue
+            if kind == "Pod" and any(
+                owner.get("controller")
+                and owner.get("kind") == "DaemonSet"
+                and owner.get("uid") in controllers
+                for owner in meta.get("ownerReferences", [])
+            ):
+                continue
+            raise ValueError(f"namespace {namespace!r} contains unrelated {kind} {meta['name']!r}")
+    return existing
+
+
+def reconcile_namespace(
+    kube: list[str], manifest: JSONObject, planned: JSONObject | None, *, adopt: bool
+) -> None:
+    """Recheck the namespace and conditionally add only the ownership label."""
+    name = manifest["metadata"]["name"]
+    current = inspect_namespace(kube, name, adopt=adopt)
+    if current is None and planned is None:
+        run(kube + ["create", "-f", "-"], json.dumps(manifest))
+        return
+    if (
+        current is None
+        or planned is None
+        or current["metadata"]["uid"] != planned["metadata"]["uid"]
+    ):
+        raise ValueError(f"namespace {name!r} changed during deployment; rerun preview")
+    metadata = current["metadata"]
+    if metadata.get("labels", {}).get(NAMESPACE_OWNER) != "true":
+        patch = {
+            "metadata": {
+                "uid": metadata["uid"],
+                "resourceVersion": metadata["resourceVersion"],
+                "labels": {NAMESPACE_OWNER: "true"},
+            }
+        }
+        run(kube + ["patch", "namespace", name, "--type=merge", "--patch", json.dumps(patch)])
+        print(f"Adopted namespace {name!r}.", file=sys.stderr)
 
 
 def talos_access(documents: list[JSONObject]) -> JSONObject:
@@ -339,17 +411,20 @@ def plan(
     list[TalosPatch],
     list[ImageTarget],
     dict[str, JSONObject],
+    JSONObject | None,
 ]:
     """Resolve inventory and prepare deployment changes without applying them."""
     kube = ["kubectl", "--request-timeout=12s"]
     if args.kube_context:
         kube += ["--context", args.kube_context]
-    talos_base = ["talosctl", "-e", args.endpoint]
+    talos_base = ["talosctl"]
+    if args.endpoint:
+        talos_base += ["-e", args.endpoint]
     if args.talosconfig:
         talos_base += ["--talosconfig", args.talosconfig]
     if args.talos_context:
         talos_base += ["--context", args.talos_context]
-    namespace_exists(kube, args.namespace)
+    namespace = inspect_namespace(kube, args.namespace, adopt=args.adopt_namespace)
     nodes = json.loads(run(kube + ["get", "nodes", "-o", "json"]))["items"]
     inventory = json.loads(args.inventory.read_text())["nodes"]
     if not inventory:
@@ -566,7 +641,7 @@ def plan(
                     f"{path}/brightness" if volume["name"] == "brightness" else path
                 )
         objects.append(ds)
-    return kube, labels, objects, access_patches, pending_images, verified_nodes
+    return kube, labels, objects, access_patches, pending_images, verified_nodes, namespace
 
 
 def may_schedule_on(spec: JSONObject, node: JSONObject) -> bool:
@@ -1256,12 +1331,21 @@ def main() -> None:
     parser.add_argument("--kube-context", default=os.environ.get("BACKLIGHT_KUBE_CONTEXT"))
     parser.add_argument("--talosconfig", default=os.environ.get("TALOSCONFIG"))
     parser.add_argument("--talos-context", default=os.environ.get("BACKLIGHT_TALOS_CONTEXT"))
-    parser.add_argument("--endpoint", default=os.environ.get("TALOS_ENDPOINT"))
+    parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("CONTROL_PLANE_IP") or os.environ.get("TALOS_ENDPOINT"),
+        help="override the selected Talos context endpoints (also accepts CONTROL_PLANE_IP)",
+    )
     parser.add_argument(
         "--image", help="digest-pinned image; defaults to the locally built release", default=None
     )
     parser.add_argument("--archive", type=Path, default=ROOT / "build/release/controller-amd64.tar")
     parser.add_argument("--namespace", default=os.environ.get("BACKLIGHT_NAMESPACE", NAMESPACE))
+    parser.add_argument(
+        "--adopt-namespace",
+        action="store_true",
+        help="approve adoption of an existing dedicated privileged namespace; preview unless --apply",
+    )
     parser.add_argument(
         "--migrate-from-namespace",
         help="remove the named legacy backlight DaemonSets before installing",
@@ -1326,8 +1410,6 @@ def deploy(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         )
         print("Recovery completed", file=sys.stderr)
         return
-    if not args.endpoint:
-        parser.error("supply --endpoint or TALOS_ENDPOINT with the Talos API endpoint")
     if not args.image:
         reference = ROOT / "build/release/image-reference.txt"
         if not reference.is_file():
@@ -1341,14 +1423,28 @@ def deploy(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         parser.error("--image must be pinned by SHA-256 digest")
     if args.apply and not args.kube_context:
         args.kube_context = run(["kubectl", "config", "current-context"]).strip()
-    kube, labels, objects, access_patches, pending_images, verified_nodes = plan(args)
-    manifest = json.dumps({"apiVersion": "v1", "kind": "List", "items": objects})
+    kube, labels, objects, access_patches, pending_images, verified_nodes, namespace = plan(args)
     if not args.apply:
-        print(manifest)
+        if (
+            namespace is not None
+            and namespace["metadata"].get("labels", {}).get(NAMESPACE_OWNER) != "true"
+        ):
+            print(
+                f"Namespace {args.namespace!r} would be adopted with --apply --adopt-namespace.",
+                file=sys.stderr,
+            )
+        print(
+            json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "List",
+                    "items": objects if namespace is None else objects[1:],
+                }
+            )
+        )
         return
     check_overlaps(kube, args.namespace, args.migrate_from_namespace, objects[3:], labels)
-    if not namespace_exists(kube, args.namespace):
-        run(kube + ["create", "-f", "-"], json.dumps(objects[0]))
+    reconcile_namespace(kube, objects[0], namespace, adopt=args.adopt_namespace)
     stage_images(args, pending_images)
     for talos, patch, node, machine_id in access_patches:
         verify_talos_machine(talos, node, machine_id)

@@ -28,6 +28,10 @@ if Path(sys.argv[0]).name == "talosctl":
         print("platform")
     elif args[-1].endswith("/max_brightness"):
         print("82311")
+elif "namespace" in args and "get" in args and os.environ.get("UNOWNED_NAMESPACE"):
+    print(json.dumps({"metadata":{"uid":"namespace-fixture","resourceVersion":"1","labels":{"pod-security.kubernetes.io/enforce":"privileged"}}}))
+elif any(arg.startswith("daemonsets,") for arg in args):
+    print(json.dumps({"items":[]}))
 elif "nodes" in args:
     print(json.dumps({"items":[{"metadata":{"name":"control-plane","uid":"fixture-control-plane","labels":{"node-role.kubernetes.io/control-plane":""}},"status":{"nodeInfo":{"machineID":"a"*32},"addresses":[{"type":"InternalIP","address":"192.0.2.10"}]}}]}))
 elif "pods" in args:
@@ -60,7 +64,8 @@ class CLITest(unittest.TestCase):
         self.env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("BACKLIGHT_") and key not in ("TALOSCONFIG", "TALOS_ENDPOINT")
+            if not key.startswith("BACKLIGHT_")
+            and key not in ("TALOSCONFIG", "TALOS_ENDPOINT", "CONTROL_PLANE_IP")
         }
         self.env.update(
             PATH=str(self.directory) + os.pathsep + os.environ["PATH"], CALL_LOG=str(self.log)
@@ -148,6 +153,50 @@ class CLITest(unittest.TestCase):
         self.assertFalse(
             any(set(call) & {"patch", "apply", "delete", "pull"} for call in self.calls())
         )
+
+    def test_preview_uses_talosconfig_endpoints_by_default(self) -> None:
+        self.env["TALOSCONFIG"] = str(self.directory / "custom-talosconfig")
+        result = self.command(
+            "deploy-backlight", "--inventory", str(self.inventory), "--image", IMAGE
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [call for call in self.calls() if call[0] == "talosctl"]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertNotIn("-e", call)
+            self.assertEqual(call[call.index("--talosconfig") + 1], self.env["TALOSCONFIG"])
+
+    def test_endpoint_override_precedence(self) -> None:
+        self.env.update(CONTROL_PLANE_IP="192.0.2.20", TALOS_ENDPOINT="192.0.2.30")
+        for override, expected in (
+            ([], "192.0.2.20"),
+            (["--endpoint", "192.0.2.40"], "192.0.2.40"),
+        ):
+            self.log.unlink(missing_ok=True)
+            result = self.command(
+                "deploy-backlight", "--inventory", str(self.inventory), "--image", IMAGE, *override
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for call in self.calls():
+                if call[0] == "talosctl":
+                    self.assertEqual(call[call.index("-e") + 1], expected)
+
+    def test_existing_namespace_requires_explicit_adoption(self) -> None:
+        self.env["UNOWNED_NAMESPACE"] = "1"
+        args = ("--inventory", str(self.inventory), "--image", IMAGE)
+        refused = self.command("deploy-backlight", *args)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("namespace 'backlight-system' is not owned", refused.stderr)
+        self.assertIn("--adopt-namespace", refused.stderr)
+        self.assertFalse(any(call[0] == "talosctl" for call in self.calls()))
+
+        preview = self.command("deploy-backlight", *args, "--adopt-namespace")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("would be adopted with --apply", preview.stderr)
+        self.assertNotIn(
+            "Namespace", {item["kind"] for item in json.loads(preview.stdout)["items"]}
+        )
+        self.assertFalse(any(set(call) & {"patch", "apply", "delete"} for call in self.calls()))
 
     def test_preview_honors_namespace_and_contexts(self) -> None:
         result = self.command(
