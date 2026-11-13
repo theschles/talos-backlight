@@ -1,0 +1,5 @@
+*
+!controller/
+!controller/*.go
+!controller/go.mod
+!controller/go.sum

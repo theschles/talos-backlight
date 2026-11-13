@@ -1,0 +1,16 @@
+/nodes.json
+/.venv/
+/build/
+/talosconfig*
+/kubeconfig*
+/.env
+*.pem
+*.key
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
+
+/preview.json
+/.mypy_cache/
+/.ruff_cache/

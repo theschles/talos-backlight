@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+"""Detect backlights, render the desired Kubernetes objects, and optionally apply them."""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import io
+import ipaddress
+import json
+import os
+import re
+import runpy
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+CLASSES = {
+    "apple-gmux": ("gmux_backlight", "platform", "templates/apple-gmux.yaml"),
+    "intel-edp": ("intel_backlight", "raw", "templates/intel-edp.yaml"),
+}
+TRIGGERS = {"localShutdown", "apiShutdown", "apiReboot"}
+CREDENTIAL = "backlight-talos-reader"
+NAMESPACE = "backlight-system"
+NAMESPACE_OWNER = "backlight.talos.dev/managed"
+POD_SECURITY = "pod-security.kubernetes.io/enforce"
+ENROLLMENT = "backlight.talos.dev/enrollment"
+MIGRATION_OWNER = "backlight.talos.dev/migration"
+DEPLOYMENT_LOCK: tuple[int, ...] = ()
+
+JSONObject = dict[str, Any]
+TalosPatch = tuple[list[str], str, str, str]
+ImageTarget = tuple[list[str], JSONObject | None, str, str, str]
+
+
+def run(command: list[str], data: str | None = None) -> str:
+    """Capture CLI output for parsing and bound each remote request."""
+    return subprocess.run(
+        command,
+        input=data,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        timeout=45,
+        pass_fds=DEPLOYMENT_LOCK,
+    ).stdout
+
+
+def checkpoint(path: Path, record: JSONObject) -> None:
+    """Persist a private recovery record before issuing a cluster mutation."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            json.dump(record, file)
+            file.flush()
+            os.fsync(file.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def begin_recovery(record: JSONObject) -> Path:
+    """Create a uniquely named recovery journal on the deployment workstation."""
+    directory = ROOT / "build" / "recovery"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"{record['kind']}-{uuid.uuid4().hex}.json"
+    checkpoint(path, record)
+    print(f"Recovery record: {path}", file=sys.stderr)
+    return path
+
+
+def finish_recovery(path: Path, record: JSONObject) -> None:
+    """Commit completion before removing a recovery record."""
+    checkpoint(path, {"kind": record["kind"], "completed": True})
+    path.unlink()
+
+
+def recover_mirror(record: JSONObject, *, confirm_quiescent: bool = False) -> None:
+    """Restore a temporary mirror only while it matches this deployment's change."""
+    talos = record["talos"]
+    node_id = record.get("node_id")
+    if not node_id:
+        raise ValueError("mirror recovery record lacks a Talos node identity; recover manually")
+    if talos_node_id(talos) != node_id:
+        raise ValueError("mirror recovery record belongs to a different Talos node")
+    current = registry_mirror(talos)
+    if current == record["previous"]:
+        if not record.get("install_confirmed") and not confirm_quiescent:
+            raise ValueError(
+                "the temporary mirror patch may still be in flight; keep the recovery record "
+                "until the request has settled"
+            )
+        return
+    if current != record["temporary"]:
+        raise ValueError("registry mirror changed externally; inspect the recovery record")
+    replace_mirror(talos, record["previous"])
+
+
+def cache_node(target: ImageTarget, mirror: JSONObject, image: str) -> None:
+    """Stage a pinned image with a recoverable mirror change on one node."""
+    talos, previous, node_id, name, machine_id = target
+    verify_talos_machine(talos, name, machine_id)
+    if talos_node_id(talos) != node_id:
+        raise ValueError("Talos node identity changed since preview; rerun deployment")
+    if registry_mirror(talos) != previous:
+        raise ValueError("registry mirror changed since preview; rerun deployment")
+    record = {
+        "kind": "mirror",
+        "talos": talos,
+        "node_id": node_id,
+        "previous": previous,
+        "temporary": mirror,
+        "install_confirmed": False,
+    }
+    path = begin_recovery(record)
+    try:
+        replace_mirror(talos, mirror)
+        record["install_confirmed"] = True
+        checkpoint(path, record)
+        run(talos + ["image", "pull", image])
+    finally:
+        try:
+            recover_mirror(record)
+        except (ValueError, OSError, subprocess.SubprocessError) as err:
+            raise ValueError(
+                f"mirror recovery incomplete, retry with --recover {path}: {err}"
+            ) from err
+        finish_recovery(path, record)
+
+
+def stage_images(args: argparse.Namespace, pending: list[ImageTarget]) -> None:
+    """Populate missing node caches and restore each temporary mirror."""
+    if not pending:
+        return
+    if not args.image.startswith("gmux.invalid/"):
+        return
+    if not args.archive.is_file():
+        raise ValueError(f"missing image archive {args.archive}")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+        route.connect((args.endpoint, 50000))
+        address = args.registry_address or route.getsockname()[0]
+    with tempfile.TemporaryDirectory(prefix="backlight-cache-") as temporary:
+        cache = Path(temporary) / "cache"
+        repository = args.image.split("/", 1)[1].split("@", 1)[0]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            runpy.run_path(str(ROOT / "prepare-cache.py"))["export"](
+                args.archive, cache, repository, "inventory"
+            )
+        if output.getvalue().strip() != args.image:
+            raise ValueError("image archive does not match the requested image digest")
+        with (Path(temporary) / "registry.log").open("w") as log:
+            server = subprocess.Popen(
+                [
+                    "talosctl",
+                    "image",
+                    "cache-serve",
+                    "--image-cache-path",
+                    str(cache),
+                    "--address",
+                    f"{address}:{args.registry_port}",
+                    "--mirror",
+                    "gmux.invalid",
+                ],
+                cwd=temporary,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                for _ in range(20):
+                    if server.poll() is not None:
+                        raise ValueError("temporary image registry failed to start")
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://{address}:{args.registry_port}/v2/", timeout=1
+                        ):
+                            break
+                    except OSError:
+                        time.sleep(0.25)
+                else:
+                    raise ValueError("temporary image registry did not become ready")
+                mirror = {
+                    "apiVersion": "v1alpha1",
+                    "kind": "RegistryMirrorConfig",
+                    "name": "gmux.invalid",
+                    "endpoints": [{"url": f"http://{address}:{args.registry_port}"}],
+                    "skipFallback": True,
+                }
+                with ThreadPoolExecutor(max_workers=4) as workers:
+                    futures = [
+                        workers.submit(cache_node, target, mirror, args.image) for target in pending
+                    ]
+                    for future in futures:
+                        future.result()
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+
+def configuration_documents(talos: list[str]) -> list[JSONObject]:
+    """Read active machine documents so patches preserve existing grants."""
+    raw = run(talos + ["get", "machineconfig", "-o", "json"])
+    decoder = json.JSONDecoder()
+    while raw.strip():
+        resource, end = decoder.raw_decode(raw.lstrip())
+        raw = raw.lstrip()[end:]
+        if resource["metadata"]["id"] == "v1alpha1":
+            documents = [doc for doc in yaml.safe_load_all(resource["spec"]) if doc is not None]
+            if any(not isinstance(doc, dict) for doc in documents):
+                raise ValueError("Talos configuration documents must be mappings")
+            return documents
+    raise ValueError("Talos machine configuration was not returned")
+
+
+def verify_talos_machine(talos: list[str], node: str, machine_id: str) -> None:
+    """Match the Talos host to the machine identity reported by the selected cluster."""
+    if not isinstance(machine_id, str) or not re.fullmatch(r"[0-9a-f]{32}", machine_id):
+        raise ValueError(f"Kubernetes node {node} has no valid machine ID")
+    if run(talos + ["read", "/etc/machine-id"]).strip() != machine_id:
+        raise ValueError(f"Talos machine ID does not match Kubernetes node {node}")
+
+
+def talos_node_id(talos: list[str]) -> str:
+    """Read the node identity persisted by Talos across reboots."""
+    resource = json.loads(
+        run(talos + ["get", "identities.cluster.talos.dev", "local", "-o", "json"])
+    )
+    node_id = resource["spec"].get("nodeId")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise ValueError("Talos did not return a valid local node identity")
+    return node_id
+
+
+def registry_mirror(talos: list[str]) -> JSONObject | None:
+    """Read the mirror document owned by the local cache registry."""
+    return next(
+        (
+            doc
+            for doc in configuration_documents(talos)
+            if doc.get("kind") == "RegistryMirrorConfig" and doc.get("name") == "gmux.invalid"
+        ),
+        None,
+    )
+
+
+def replace_mirror(talos: list[str], document: JSONObject | None) -> None:
+    """Replace the whole mirror atomically because Talos merges endpoint lists."""
+    remove = {
+        "apiVersion": "v1alpha1",
+        "kind": "RegistryMirrorConfig",
+        "name": "gmux.invalid",
+        "$patch": "delete",
+    }
+    patch = yaml.safe_dump_all([remove, document] if document is not None else [remove])
+    run(talos + ["patch", "machineconfig", "--mode=no-reboot", "--patch", patch])
+    if registry_mirror(talos) != document:
+        raise ValueError("temporary registry mirror replacement did not match the requested state")
+
+
+def get_object(
+    kube: list[str], kind: str, name: str, namespace: str | None = None
+) -> JSONObject | None:
+    """Fetch a named object, distinguishing an absent object from a failed request."""
+    scope = ["-n", namespace] if namespace else []
+    raw = run(kube + scope + ["get", kind, name, "--ignore-not-found", "-o", "json"])
+    return json.loads(raw) if raw.strip() else None
+
+
+def namespace_exists(kube: list[str], namespace: str) -> bool:
+    """Refuse to adopt a namespace or weaken its existing admission policy."""
+    existing = get_object(kube, "namespace", namespace)
+    if existing is None:
+        return False
+    labels = existing["metadata"].get("labels", {})
+    if labels.get(NAMESPACE_OWNER) != "true" or labels.get(POD_SECURITY) != "privileged":
+        raise ValueError(
+            f"namespace {namespace} is not a managed, dedicated privileged backlight namespace"
+        )
+    if existing["metadata"].get("deletionTimestamp"):
+        raise ValueError(f"namespace {namespace} is terminating")
+    return True
+
+
+def talos_access(documents: list[JSONObject]) -> JSONObject:
+    """Read the active standalone document or Talos's legacy feature settings."""
+    for doc in documents:
+        if doc.get("kind") == "KubeTalosAPIAccessConfig":
+            return doc
+    for doc in documents:
+        machine = doc.get("machine") or {}
+        features = machine.get("features") or {}
+        legacy = features.get("kubernetesTalosAPIAccess") or {}
+        if legacy.get("enabled") is True:
+            return legacy
+    return {}
+
+
+def reader_access(existing: JSONObject, namespace: str) -> JSONObject:
+    """Add the namespace only when the cluster-wide role grant remains read-only."""
+    roles = set(existing.get("allowedRoles", []))
+    namespaces = set(existing.get("allowedKubernetesNamespaces", []))
+    if roles - {"os:reader"}:
+        raise ValueError(f"existing Talos API roles exceed os:reader: {', '.join(sorted(roles))}")
+    if not roles and namespaces - {namespace}:
+        raise ValueError("adding os:reader would grant access to other Talos API namespaces")
+    return {
+        "apiVersion": "v1alpha1",
+        "kind": "KubeTalosAPIAccessConfig",
+        "allowedRoles": ["os:reader"],
+        "allowedKubernetesNamespaces": sorted(namespaces | {namespace}),
+    }
+
+
+def plan(
+    args: argparse.Namespace,
+) -> tuple[
+    list[str],
+    dict[str, str],
+    list[JSONObject],
+    list[TalosPatch],
+    list[ImageTarget],
+    dict[str, JSONObject],
+]:
+    """Resolve inventory and prepare deployment changes without applying them."""
+    kube = ["kubectl", "--request-timeout=12s"]
+    if args.kube_context:
+        kube += ["--context", args.kube_context]
+    talos_base = ["talosctl", "-e", args.endpoint]
+    if args.talosconfig:
+        talos_base += ["--talosconfig", args.talosconfig]
+    if args.talos_context:
+        talos_base += ["--context", args.talos_context]
+    namespace_exists(kube, args.namespace)
+    nodes = json.loads(run(kube + ["get", "nodes", "-o", "json"]))["items"]
+    inventory = json.loads(args.inventory.read_text())["nodes"]
+    if not inventory:
+        raise ValueError("inventory must contain at least one node")
+    members: dict[str, list[str]] = {name: [] for name in CLASSES}
+    labels: dict[str, str] = {}
+    verified_nodes: dict[str, JSONObject] = {}
+    levels: dict[str, int] = {}
+    triggers: dict[str, dict[str, bool]] = {}
+    nicknames: set[str] = set()
+    access_patches: list[TalosPatch] = []
+    pending_images: list[ImageTarget] = []
+    by_name = {node["metadata"]["name"]: node for node in nodes}
+    kubernetes_names = set(by_name)
+    verified_addresses: set[tuple[str, str]] = set()
+    has_control_plane = False
+    for cluster_node in nodes:
+        if "node-role.kubernetes.io/control-plane" not in cluster_node["metadata"].get(
+            "labels", {}
+        ):
+            continue
+        has_control_plane = True
+        addresses = [
+            address["address"]
+            for address in cluster_node["status"].get("addresses", [])
+            if address["type"] == "InternalIP"
+        ]
+        if not addresses:
+            raise ValueError("control-plane node has no internal IP")
+        talos = talos_base + ["-n", addresses[0]]
+        name = cluster_node["metadata"]["name"]
+        machine_id = cluster_node["status"].get("nodeInfo", {}).get("machineID", "")
+        verify_talos_machine(talos, name, machine_id)
+        verified_addresses.add((name, addresses[0]))
+        documents = configuration_documents(talos)
+        existing = talos_access(documents)
+        access = reader_access(existing, args.namespace)
+        if access != existing:
+            access_patches.append((talos, json.dumps(access), name, machine_id))
+    if not has_control_plane:
+        raise ValueError("no Talos control-plane node found")
+    for entry in inventory:
+        ip = str(ipaddress.ip_address(entry["ip"]))
+        matches = [
+            node["metadata"]["name"]
+            for node in nodes
+            if {"type": "InternalIP", "address": ip} in node["status"].get("addresses", [])
+        ]
+        if len(matches) != 1 or matches[0] in labels:
+            raise ValueError(f"{ip}: expected a unique Kubernetes node")
+        name = matches[0]
+        if "nickname" in entry:
+            nickname = entry["nickname"]
+            if not re.fullmatch(
+                r"[a-z0-9][a-z0-9.-]*", nickname
+            ) or nickname in nicknames | kubernetes_names | {"all"}:
+                raise ValueError(f"{name}: invalid or duplicate nickname")
+            nicknames.add(nickname)
+        if "startupPercent" in entry:
+            value = entry["startupPercent"]
+            if type(value) is not int or not 1 <= value <= 100:
+                raise ValueError(f"{name}: startupPercent must be an integer from 1 to 100")
+            levels[name] = value
+        if "restoreOnShutdown" in entry:
+            overrides = entry["restoreOnShutdown"]
+            if (
+                not isinstance(overrides, dict)
+                or overrides.keys() - TRIGGERS
+                or any(type(value) is not bool for value in overrides.values())
+            ):
+                raise ValueError(f"{name}: invalid restoreOnShutdown overrides")
+            triggers[name] = overrides
+
+        talos = talos_base + ["-n", ip]
+        machine_id = by_name[name]["status"].get("nodeInfo", {}).get("machineID", "")
+        if (name, ip) not in verified_addresses:
+            verify_talos_machine(talos, name, machine_id)
+        documents = configuration_documents(talos)
+        listing = run(talos + ["ls", "/sys/class/backlight"])
+        detected = [
+            key
+            for key, (device, _, _) in CLASSES.items()
+            if re.search(rf"(?m)(?:^|/|\s){re.escape(device)}\s*$", listing)
+        ]
+        selected = entry.get("classOverride")
+        if selected is None and len(detected) == 1:
+            selected = detected[0]
+        if selected not in CLASSES:
+            raise ValueError(
+                f"{name}: expected one supported backlight interface or a classOverride"
+            )
+        device, kind, _ = CLASSES[selected]
+        path = f"/sys/class/backlight/{device}"
+        if run(talos + ["read", f"{path}/type"]).strip() != kind:
+            raise ValueError(f"{name}: {path} has unexpected backlight type")
+        if int(run(talos + ["read", f"{path}/max_brightness"]).strip()) < 1:
+            raise ValueError(f"{name}: {path} has invalid maximum")
+        if args.apply and args.image.startswith("gmux.invalid/"):
+            images = run(talos + ["image", "ls"])
+            if not any(args.image in line.split() for line in images.splitlines()):
+                previous = next(
+                    (
+                        doc
+                        for doc in documents
+                        if doc
+                        and doc.get("kind") == "RegistryMirrorConfig"
+                        and doc.get("name") == "gmux.invalid"
+                    ),
+                    None,
+                )
+                pending_images.append((talos, previous, talos_node_id(talos), name, machine_id))
+        verified_nodes[name] = by_name[name]
+        labels[name] = selected
+        members[selected].append(name)
+        print(f"{name} ({ip}) -> {selected}", file=sys.stderr)
+
+    settings = json.dumps({"nodes": levels, "shutdown": {"triggers": triggers}}, sort_keys=True)
+    config = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "backlight-defaults", "namespace": args.namespace},
+        "data": {"levels.json": settings},
+    }
+    objects: list[JSONObject] = [
+        {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": args.namespace,
+                "labels": {POD_SECURITY: "privileged", NAMESPACE_OWNER: "true"},
+            },
+        },
+        {
+            "apiVersion": "talos.dev/v1alpha1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": CREDENTIAL, "namespace": args.namespace},
+            "spec": {"roles": ["os:reader"]},
+        },
+        config,
+    ]
+    for key, (device, _, template) in CLASSES.items():
+        if not members[key]:
+            continue
+        ds = json.loads(
+            run(kube + ["create", "--dry-run=client", "-f", str(ROOT / template), "-o", "json"])
+        )
+        ds["metadata"]["namespace"] = args.namespace
+        pod = ds["spec"]["template"]
+        pod["metadata"]["annotations"] = {
+            "backlight/config-sha256": hashlib.sha256(settings.encode()).hexdigest()
+        }
+        spec = pod["spec"]
+        spec["affinity"] = {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": ENROLLMENT,
+                                    "operator": "In",
+                                    "values": [enrollment_id(verified_nodes[name])],
+                                }
+                            ],
+                            "matchFields": [
+                                {"key": "metadata.name", "operator": "In", "values": [name]}
+                            ],
+                        }
+                        for name in sorted(members[key])
+                    ]
+                }
+            }
+        }
+        spec.setdefault(
+            "tolerations",
+            [
+                {
+                    "key": "node-role.kubernetes.io/control-plane",
+                    "operator": "Exists",
+                    "effect": "NoSchedule",
+                }
+            ],
+        )
+        container = spec["containers"][0]
+        container["image"] = args.image
+        container["resources"]["limits"]["memory"] = "64Mi"
+        container["env"].append(
+            {
+                "name": "BACKLIGHT_TALOS_HOST",
+                "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}},
+            }
+        )
+        container["volumeMounts"].append(
+            {"name": "talos-reader", "mountPath": "/etc/backlight-talos", "readOnly": True}
+        )
+        spec["volumes"].append(
+            {
+                "name": "talos-reader",
+                "secret": {
+                    "secretName": CREDENTIAL,
+                    "defaultMode": 256,
+                    "items": [{"key": "config", "path": "talosconfig"}],
+                },
+            }
+        )
+        container["volumeMounts"] = [
+            mount for mount in container["volumeMounts"] if mount["name"] != "model"
+        ]
+        spec["volumes"] = [volume for volume in spec["volumes"] if volume["name"] != "model"]
+        for volume in spec["volumes"]:
+            if volume["name"] in ("panel", "brightness"):
+                path = f"/sys/class/backlight/{device}"
+                volume["hostPath"]["path"] = (
+                    f"{path}/brightness" if volume["name"] == "brightness" else path
+                )
+        objects.append(ds)
+    return kube, labels, objects, access_patches, pending_images, verified_nodes
+
+
+def may_schedule_on(spec: JSONObject, node: JSONObject) -> bool:
+    """Exclude nodes only when selector constraints prove they cannot be targeted."""
+    meta = node["metadata"]
+    labels = meta.get("labels", {})
+    if any(labels.get(key) != value for key, value in spec.get("nodeSelector", {}).items()):
+        return False
+    terms = (
+        spec.get("affinity", {})
+        .get("nodeAffinity", {})
+        .get("requiredDuringSchedulingIgnoredDuringExecution", {})
+        .get("nodeSelectorTerms")
+    )
+    return terms is None or any(
+        not any(
+            field.get("key") == "metadata.name"
+            and field.get("operator") == "In"
+            and meta["name"] not in field.get("values", [])
+            for field in term.get("matchFields", [])
+        )
+        for term in terms
+    )
+
+
+def check_overlaps(
+    kube: list[str],
+    namespace: str,
+    legacy: str | None,
+    daemonsets: list[JSONObject],
+    labels: dict[str, str],
+) -> None:
+    """Reject other workloads that may write to an inventory node's backlight."""
+    names = {ds["metadata"]["name"] for ds in daemonsets}
+    allowed = {(scope, name) for scope in (namespace, legacy) for name in names}
+    known_names = {"gmux-backlight", "dell-backlight"}
+    unlisted = []
+    if legacy:
+        unlisted = [
+            node
+            for node in json.loads(run(kube + ["get", "nodes", "-o", "json"]))["items"]
+            if node["metadata"]["name"] not in labels
+        ]
+    for kind in ("daemonsets", "pods"):
+        objects = json.loads(run(kube + ["get", kind, "-A", "-o", "json"]))["items"]
+        for obj in objects:
+            meta = obj["metadata"]
+            spec = obj["spec"]["template"]["spec"] if kind == "daemonsets" else obj["spec"]
+            if kind == "pods":
+                if obj["status"].get("phase") in ("Succeeded", "Failed"):
+                    continue
+                owner = next(
+                    (
+                        owner["name"]
+                        for owner in meta.get("ownerReferences", [])
+                        if owner.get("controller") and owner.get("kind") == "DaemonSet"
+                    ),
+                    None,
+                )
+                node_name = spec.get("nodeName")
+                if node_name not in labels:
+                    if node_name and meta["namespace"] == legacy and owner in names:
+                        raise ValueError(f"legacy {owner} serves unlisted node {node_name}")
+                    continue
+            else:
+                owner = meta["name"]
+                if meta["namespace"] == legacy and owner in names:
+                    for node in unlisted:
+                        if may_schedule_on(spec, node):
+                            raise ValueError(
+                                f"legacy {owner} may serve unlisted node {node['metadata']['name']}"
+                            )
+                selected = spec.get("nodeSelector", {}).get("backlight-class")
+                if selected and selected not in labels.values():
+                    continue
+            if (meta["namespace"], owner) in allowed:
+                continue
+            paths = [
+                volume.get("hostPath", {}).get("path", "") for volume in spec.get("volumes", [])
+            ]
+            if owner in known_names or any(
+                path == "/var/lib/gmux-backlight"
+                or path.startswith("/var/lib/gmux-backlight/")
+                or path.endswith("/gmux_backlight/brightness")
+                or path.endswith("/intel_backlight/brightness")
+                for path in paths
+            ):
+                raise ValueError(
+                    f"potential backlight writer overlaps inventory: {meta['namespace']}/{meta['name']}"
+                )
+
+
+def wait_rollout(kube: list[str], namespace: str, name: str) -> None:
+    """Wait for Kubernetes to finish replacing the DaemonSet pods."""
+    command = [arg for arg in kube if not arg.startswith("--request-timeout=")]
+    subprocess.run(
+        command + ["-n", namespace, "rollout", "status", f"ds/{name}", "--timeout=90s"],
+        check=True,
+        timeout=95,
+    )
+
+
+def verify_controllers(
+    kube: list[str],
+    namespace: str,
+    daemonsets: list[JSONObject],
+    labels: dict[str, str],
+) -> None:
+    """Check manual status and the authenticated event subscription per node."""
+    for ds in daemonsets:
+        name = ds["metadata"]["name"]
+        selector = ds["spec"]["selector"]["matchLabels"]
+        class_name = ds["spec"]["template"]["spec"]["nodeSelector"]["backlight-class"]
+        deployed = get_object(kube, "ds", name, namespace)
+        if deployed is None:
+            raise ValueError(f"DaemonSet {name} disappeared after rollout")
+        uid = deployed["metadata"]["uid"]
+        expected = {node for node, value in labels.items() if value == class_name}
+        query = kube + [
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "-l",
+            ",".join(f"{key}={value}" for key, value in selector.items()),
+            "-o",
+            "json",
+        ]
+        connected: set[str] = set()
+        manual: set[str] = set()
+        ready: set[str] = set()
+        blocked: dict[str, str] = {}
+        deadline = time.monotonic() + 30
+        while ready != expected:
+            ready.clear()
+            connected.clear()
+            manual.clear()
+            for pod in json.loads(run(query))["items"]:
+                node = pod["spec"].get("nodeName")
+                meta = pod["metadata"]
+                if (
+                    node not in expected - ready
+                    or meta.get("deletionTimestamp")
+                    or not any(owner.get("uid") == uid for owner in meta.get("ownerReferences", []))
+                    or pod["status"].get("phase") != "Running"
+                ):
+                    continue
+                try:
+                    status = json.loads(
+                        run(
+                            kube
+                            + [
+                                "-n",
+                                namespace,
+                                "exec",
+                                f"pod/{meta['name']}",
+                                "-c",
+                                "backlight",
+                                "--",
+                                "/backlight",
+                                "status",
+                            ]
+                        )
+                    )
+                except (subprocess.SubprocessError, ValueError):
+                    continue
+                manual.add(node)
+                if status.get("shutdown_listener_connected") is True:
+                    connected.add(node)
+                else:
+                    connected.discard(node)
+                if (
+                    node in connected
+                    and status.get("shutdown_restoration_ready") is True
+                    and not status.get("restoration_error")
+                ):
+                    ready.add(node)
+                else:
+                    blocked[node] = (
+                        status.get("restoration_error") or "panel or listener unavailable"
+                    )
+            if ready == expected or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        for node in sorted(expected):
+            print(
+                f"{node}: brightness API {'ready' if node in manual else 'unavailable'}, "
+                f"shutdown listener {'connected' if node in connected else 'unavailable'}, "
+                f"restoration {'ready' if node in ready else blocked.get(node, 'unavailable')}",
+                file=sys.stderr,
+            )
+        if ready != expected:
+            raise ValueError(
+                f"{name}: shutdown restoration unavailable on {', '.join(sorted(expected - ready))}"
+            )
+
+
+def object_payload(obj: JSONObject) -> JSONObject:
+    """Remove Kubernetes-generated fields before comparing or restoring a snapshot."""
+    payload = dict(obj)
+    metadata = dict(obj["metadata"])
+    for key in (
+        "uid",
+        "resourceVersion",
+        "generation",
+        "creationTimestamp",
+        "managedFields",
+        "deletionTimestamp",
+        "deletionGracePeriodSeconds",
+    ):
+        metadata.pop(key, None)
+    payload["metadata"] = metadata
+    payload.pop("status", None)
+    return payload
+
+
+def object_identity(kind: str, obj: JSONObject) -> JSONObject:
+    """Identify an object and the revision of its desired configuration."""
+    meta = obj["metadata"]
+    revision = "generation" if kind == "ds" else "resourceVersion"
+    return {"uid": meta["uid"], revision: meta[revision]}
+
+
+def restore_object(
+    kube: list[str],
+    kind: str,
+    name: str,
+    namespace: str,
+    saved: JSONObject | None,
+    *,
+    expected: JSONObject | None = None,
+    owner: str | None = None,
+    identity: JSONObject | None = None,
+) -> JSONObject | None:
+    """Conditionally mutate a snapshotted object or a migration-owned replacement."""
+    scope = kube + ["-n", namespace]
+    current = get_object(kube, kind, name, namespace)
+    if current is None:
+        if saved is not None:
+            if expected is not None:
+                raise ValueError(f"{namespace}/{kind}/{name} disappeared during migration")
+            return json.loads(
+                run(scope + ["create", "-f", "-", "-o", "json"], json.dumps(object_payload(saved)))
+            )
+        return None
+    meta = current["metadata"]
+    if (
+        saved is not None
+        and not meta.get("deletionTimestamp")
+        and object_payload(current) == object_payload(saved)
+    ):
+        return None
+    matches_snapshot = (
+        expected is not None
+        and meta["uid"] == expected["metadata"]["uid"]
+        and object_payload(current) == object_payload(expected)
+    )
+    owned = (
+        owner is not None
+        and meta.get("annotations", {}).get(MIGRATION_OWNER) == owner
+        and (identity is None or object_identity(kind, current) == identity)
+    )
+    if not matches_snapshot and not owned:
+        raise ValueError(f"{namespace}/{kind}/{name} changed outside this migration")
+    if saved is None:
+        if not meta.get("deletionTimestamp"):
+            prefix, plural = {
+                "ds": ("/apis/apps/v1", "daemonsets"),
+                "configmap": ("/api/v1", "configmaps"),
+            }[kind]
+            options = {
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Foreground",
+                "preconditions": {"uid": meta["uid"], "resourceVersion": meta["resourceVersion"]},
+            }
+            resource = f"{prefix}/namespaces/{namespace}/{plural}/{name}"
+            run(kube + ["delete", "--raw", resource, "-f", "-"], json.dumps(options))
+        run(scope + ["wait", "--for=delete", f"{kind}/{name}", "--timeout=40s"])
+        return None
+    if meta.get("deletionTimestamp"):
+        run(scope + ["wait", "--for=delete", f"{kind}/{name}", "--timeout=40s"])
+        # A create conflicts safely if a newer object appeared while waiting.
+        return json.loads(
+            run(scope + ["create", "-f", "-", "-o", "json"], json.dumps(object_payload(saved)))
+        )
+    restored = object_payload(saved)
+    restored["metadata"]["resourceVersion"] = meta["resourceVersion"]
+    restored["metadata"]["uid"] = meta["uid"]
+    return json.loads(run(scope + ["replace", "-f", "-", "-o", "json"], json.dumps(restored)))
+
+
+def enrollment_id(node: JSONObject) -> str:
+    """Derive a scheduler label from the verified Kubernetes node identity."""
+    uid = node["metadata"].get("uid")
+    machine_id = node.get("status", {}).get("nodeInfo", {}).get("machineID")
+    if not uid or not machine_id:
+        raise ValueError(f"Kubernetes node {node['metadata']['name']} lacks enrollment identity")
+    return hashlib.sha256(f"{uid}:{machine_id}".encode()).hexdigest()[:32]
+
+
+def migration_label(
+    kube: list[str],
+    node: str,
+    snapshot: JSONObject,
+    label: str | None,
+    token: str | None,
+    *,
+    enrollment: str | None = None,
+    rollback: bool = False,
+) -> None:
+    """Change one node label with ownership and resource-version checks."""
+    current = get_object(kube, "node", node)
+    if current is None or current["metadata"]["uid"] != snapshot["metadata"]["uid"]:
+        raise ValueError(f"node {node} was replaced during deployment")
+    if enrollment is not None and enrollment_id(current) != enrollment:
+        raise ValueError(f"node {node} no longer matches its verified enrollment identity")
+    meta = current["metadata"]
+    prior = snapshot["metadata"]
+    previous = prior.get("labels", {}).get("backlight-class")
+    previous_owner = prior.get("annotations", {}).get(MIGRATION_OWNER)
+    present = meta.get("labels", {}).get("backlight-class")
+    present_owner = meta.get("annotations", {}).get(MIGRATION_OWNER)
+    previous_enrollment = prior.get("labels", {}).get(ENROLLMENT)
+    present_enrollment = meta.get("labels", {}).get(ENROLLMENT)
+    if enrollment is not None:
+        expected_enrollment = enrollment if rollback else previous_enrollment
+        already_restored = rollback and (present, present_owner, present_enrollment) == (
+            previous,
+            previous_owner,
+            previous_enrollment,
+        )
+        if not already_restored and present_enrollment != expected_enrollment:
+            raise ValueError(f"node {node} enrollment label changed outside this deployment")
+    if (
+        rollback
+        and (present, present_owner) == (previous, previous_owner)
+        and (enrollment is None or present_enrollment == previous_enrollment)
+    ):
+        return
+    expected = (label, token) if rollback else (previous, previous_owner)
+    if (present, present_owner) != expected:
+        raise ValueError(f"node {node} label changed outside this migration")
+    patch = {
+        "metadata": {
+            "uid": meta["uid"],
+            "resourceVersion": meta["resourceVersion"],
+            "labels": {"backlight-class": previous if rollback else label},
+            "annotations": {
+                MIGRATION_OWNER: previous_owner if rollback or token is None else token
+            },
+        }
+    }
+    if enrollment is not None:
+        patch["metadata"]["labels"][ENROLLMENT] = previous_enrollment if rollback else enrollment
+    run(kube + ["patch", "node", node, "--type=merge", "--patch", json.dumps(patch)])
+
+
+def apply_workloads(
+    kube: list[str],
+    namespace: str,
+    legacy: str | None,
+    config: JSONObject,
+    daemonsets: list[JSONObject],
+    labels: dict[str, str],
+    verified_nodes: dict[str, JSONObject],
+) -> None:
+    """Reconcile workloads and restore the prior installation if migration fails."""
+    names = [ds["metadata"]["name"] for ds in daemonsets]
+    snapshots: list[tuple[str, str, str, JSONObject | None]] = []
+    enrollments = {node: enrollment_id(snapshot) for node, snapshot in verified_nodes.items()}
+    previous_nodes: dict[str, JSONObject] = {}
+    if legacy:
+        snapshots.append(
+            (
+                "configmap",
+                config["metadata"]["name"],
+                namespace,
+                get_object(kube, "configmap", config["metadata"]["name"], namespace),
+            )
+        )
+        for name in names:
+            for scope in (legacy, namespace):
+                snapshots.append(("ds", name, scope, get_object(kube, "ds", name, scope)))
+        for node in labels:
+            original = get_object(kube, "node", node)
+            if original is None or enrollment_id(original) != enrollments[node]:
+                raise ValueError(f"node {node} no longer matches its verified enrollment identity")
+            previous_nodes[node] = original
+    record: JSONObject = {}
+    journal = None
+    if legacy:
+        cluster = get_object(kube, "namespace", "kube-system")
+        if cluster is None:
+            raise ValueError("cannot identify the Kubernetes cluster for recovery")
+        by_class = {
+            ds["spec"]["template"]["spec"]["nodeSelector"]["backlight-class"]: ds["metadata"][
+                "name"
+            ]
+            for ds in daemonsets
+        }
+        record = {
+            "kind": "migration",
+            "kube": kube,
+            "cluster_uid": cluster["metadata"]["uid"],
+            "namespace": namespace,
+            "legacy": legacy,
+            "names": names,
+            "snapshots": snapshots,
+            "previous_nodes": previous_nodes,
+            "enrollments": enrollments,
+            "desired_labels": labels,
+            "token": uuid.uuid4().hex,
+            "node_controllers": {node: by_class[class_name] for node, class_name in labels.items()},
+            "removed": [],
+            "relabeled": [],
+            "attempted": [],
+            "in_flight": None,
+            "identities": {},
+            "stopped": [],
+            "labels_restored": [],
+            "objects_restored": [],
+        }
+        check_overlaps(kube, namespace, legacy, daemonsets, labels)
+        journal = begin_recovery(record)
+    try:
+        if legacy and journal is not None:
+            for name in names:
+                record["removed"].append(name)
+                record["in_flight"] = f"delete {legacy}/ds/{name}"
+                checkpoint(journal, record)
+                original = next(
+                    saved
+                    for kind, key, scope, saved in snapshots
+                    if (kind, key, scope) == ("ds", name, legacy)
+                )
+                restore_object(kube, "ds", name, legacy, None, expected=original)
+                record["in_flight"] = None
+                checkpoint(journal, record)
+        for node, class_name in labels.items():
+            if journal is not None:
+                record["relabeled"].append(node)
+                record["in_flight"] = f"label node/{node}"
+                checkpoint(journal, record)
+                migration_label(
+                    kube,
+                    node,
+                    previous_nodes[node],
+                    class_name,
+                    record["token"],
+                    enrollment=enrollments[node],
+                )
+                record["in_flight"] = None
+                checkpoint(journal, record)
+            else:
+                migration_label(
+                    kube, node, verified_nodes[node], class_name, None, enrollment=enrollments[node]
+                )
+        if journal is None:
+            manifest = {"apiVersion": "v1", "kind": "List", "items": [config, *daemonsets]}
+            print(run(kube + ["apply", "-f", "-"], json.dumps(manifest)), end="")
+        else:
+            for obj in [config, *daemonsets]:
+                kind = "ds" if obj["kind"] == "DaemonSet" else "configmap"
+                name = obj["metadata"]["name"]
+                original = next(
+                    saved
+                    for k, n, scope, saved in snapshots
+                    if (k, n, scope) == (kind, name, namespace)
+                )
+                desired = object_payload(obj)
+                meta = desired["metadata"]
+                meta["annotations"] = {
+                    **meta.get("annotations", {}),
+                    MIGRATION_OWNER: record["token"],
+                }
+                record["attempted"].append(name)
+                record["in_flight"] = f"install {namespace}/{kind}/{name}"
+                checkpoint(journal, record)
+                installed = restore_object(kube, kind, name, namespace, desired, expected=original)
+                if installed is not None:
+                    record["identities"][f"{kind}/{name}"] = object_identity(kind, installed)
+                record["in_flight"] = None
+                checkpoint(journal, record)
+        for name in names:
+            wait_rollout(kube, namespace, name)
+        verify_controllers(kube, namespace, daemonsets, labels)
+    except (Exception, KeyboardInterrupt):
+        if journal is not None:
+            recover_record(journal, record)
+            print("Migration failed and previous workloads were restored", file=sys.stderr)
+        raise
+    if journal is not None:
+        finish_recovery(journal, record)
+
+
+def recover_migration(path: Path, record: JSONObject, *, confirm_quiescent: bool) -> None:
+    """Restore each class independently after stopping its replacement."""
+    unresolved = record.get("in_flight", "untracked write in older recovery record")
+    if unresolved is not None and not confirm_quiescent:
+        raise ValueError(
+            f"migration write may still be in flight ({unresolved}); "
+            "use --confirm-migration-quiescent only after verifying it can no longer apply"
+        )
+    kube = record["kube"]
+    cluster = get_object(kube, "namespace", "kube-system")
+    if cluster is None or cluster["metadata"]["uid"] != record["cluster_uid"]:
+        raise ValueError("recovery record belongs to a different Kubernetes cluster")
+    if unresolved is not None:
+        record["in_flight"] = None
+        checkpoint(path, record)
+    namespace, legacy = record["namespace"], record["legacy"]
+    failures: list[str] = []
+    attempted = set(record["attempted"])
+    identities = record.get("identities", {})
+    stopped = set(record["stopped"]) | (set(record["names"]) - attempted)
+    for name in record["names"]:
+        if name in stopped:
+            continue
+        try:
+            original = next(
+                (
+                    saved
+                    for kind, key, scope, saved in record["snapshots"]
+                    if (kind, key, scope) == ("ds", name, namespace)
+                ),
+                None,
+            )
+            current = get_object(kube, "ds", name, namespace)
+            if (
+                current is None
+                or original is None
+                or object_payload(current) != object_payload(original)
+            ):
+                restore_object(
+                    kube,
+                    "ds",
+                    name,
+                    namespace,
+                    None,
+                    owner=record["token"],
+                    identity=identities.get(f"ds/{name}"),
+                )
+            record["stopped"].append(name)
+            checkpoint(path, record)
+            stopped.add(name)
+        except (ValueError, OSError, subprocess.SubprocessError) as err:
+            failures.append(f"stop {namespace}/{name}: {err}")
+
+    def require_destination_absent(name: str) -> None:
+        if get_object(kube, "ds", name, namespace) is not None:
+            raise ValueError(f"destination {namespace}/ds/{name} still exists")
+
+    def require_destination_pods_absent(names: set[str], config_name: str | None = None) -> None:
+        pods = json.loads(run(kube + ["-n", namespace, "get", "pods", "-o", "json"]))["items"]
+        for pod in pods:
+            if pod["status"].get("phase") in ("Succeeded", "Failed"):
+                continue
+            meta = pod["metadata"]
+            controllers = {
+                owner["name"]
+                for owner in meta.get("ownerReferences", [])
+                if owner.get("kind") == "DaemonSet"
+            }
+            controllers.add(meta.get("labels", {}).get("app.kubernetes.io/name", ""))
+            volumes = pod["spec"].get("volumes", [])
+            paths = {volume.get("hostPath", {}).get("path", "") for volume in volumes}
+            panel = any(
+                ("/gmux_backlight/" in path + "/" and "gmux-backlight" in names)
+                or ("/intel_backlight/" in path + "/" and "dell-backlight" in names)
+                for path in paths
+            )
+            uses_config = config_name is not None and any(
+                volume.get("configMap", {}).get("name") == config_name for volume in volumes
+            )
+            if controllers & names or panel or uses_config:
+                raise ValueError(f"active destination Pod {meta['name']} still exists")
+
+    for node in record["relabeled"]:
+        controller = record["node_controllers"][node]
+        if node in record["labels_restored"] or controller not in stopped:
+            continue
+        try:
+            require_destination_absent(controller)
+            require_destination_pods_absent({controller})
+            migration_label(
+                kube,
+                node,
+                record["previous_nodes"][node],
+                record["desired_labels"][node],
+                record["token"],
+                enrollment=record.get("enrollments", {}).get(node),
+                rollback=True,
+            )
+            record["labels_restored"].append(node)
+            checkpoint(path, record)
+        except (ValueError, OSError, subprocess.SubprocessError) as err:
+            failures.append(f"restore label on {node}: {err}")
+    config_restored = not any(
+        kind == "configmap" and name in attempted for kind, name, _, _ in record["snapshots"]
+    )
+    for kind, name, scope, saved in record["snapshots"]:
+        key = f"{scope}/{kind}/{name}"
+        if key in record["objects_restored"]:
+            if kind == "configmap":
+                config_restored = True
+            continue
+        if scope == legacy and name not in record["removed"]:
+            continue
+        if scope == namespace and name not in attempted:
+            continue
+        if kind == "configmap":
+            if stopped != set(record["names"]):
+                continue
+        else:
+            if saved is None or name not in stopped or (scope == namespace and not config_restored):
+                continue
+            if any(
+                record["node_controllers"][node] == name and node not in record["labels_restored"]
+                for node in record["relabeled"]
+            ):
+                continue
+        try:
+            if kind == "configmap":
+                for controller in record["names"]:
+                    require_destination_absent(controller)
+                require_destination_pods_absent(set(record["names"]), name)
+            elif scope == legacy:
+                require_destination_absent(name)
+                require_destination_pods_absent({name})
+            restore_object(
+                kube,
+                kind,
+                name,
+                scope,
+                saved,
+                owner=record["token"] if kind == "configmap" else None,
+                identity=identities.get(f"configmap/{name}") if kind == "configmap" else None,
+            )
+            if kind == "ds":
+                wait_rollout(kube, scope, name)
+            record["objects_restored"].append(key)
+            checkpoint(path, record)
+            if kind == "configmap":
+                config_restored = True
+        except (ValueError, OSError, subprocess.SubprocessError) as err:
+            failures.append(f"restore {key}: {err}")
+    if failures:
+        raise ValueError("migration rollback incomplete: " + " | ".join(failures))
+
+
+def recover_record(
+    path: Path,
+    record: JSONObject,
+    *,
+    confirm_quiescent: bool = False,
+    confirm_migration_quiescent: bool = False,
+) -> None:
+    """Resume an interrupted rollback and retain the journal on failure."""
+    if record.get("completed") is True:
+        path.unlink()
+        return
+    try:
+        if record["kind"] == "mirror" and record["talos"][0] == "talosctl":
+            recover_mirror(record, confirm_quiescent=confirm_quiescent)
+        elif record["kind"] == "migration" and record["kube"][0] == "kubectl":
+            if not record.get("token"):
+                raise ValueError(
+                    "legacy recovery record lacks object ownership; inspect it before manual recovery"
+                )
+            recover_migration(path, record, confirm_quiescent=confirm_migration_quiescent)
+        else:
+            raise ValueError("unknown recovery record type")
+    except (ValueError, OSError, subprocess.SubprocessError) as err:
+        raise ValueError(f"{err}; retry with --recover {path}") from err
+    finish_recovery(path, record)
+
+
+def main() -> None:
+    """Validate invocation and preview or reconcile the inventory."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--inventory",
+        type=Path,
+        default=Path(os.environ.get("BACKLIGHT_INVENTORY", ROOT / "nodes.json")),
+    )
+    parser.add_argument("--kube-context", default=os.environ.get("BACKLIGHT_KUBE_CONTEXT"))
+    parser.add_argument("--talosconfig", default=os.environ.get("TALOSCONFIG"))
+    parser.add_argument("--talos-context", default=os.environ.get("BACKLIGHT_TALOS_CONTEXT"))
+    parser.add_argument("--endpoint", default=os.environ.get("TALOS_ENDPOINT"))
+    parser.add_argument(
+        "--image", help="digest-pinned image; defaults to the locally built release", default=None
+    )
+    parser.add_argument("--archive", type=Path, default=ROOT / "build/release/controller-amd64.tar")
+    parser.add_argument("--namespace", default=os.environ.get("BACKLIGHT_NAMESPACE", NAMESPACE))
+    parser.add_argument(
+        "--migrate-from-namespace",
+        help="remove the named legacy backlight DaemonSets before installing",
+    )
+    parser.add_argument(
+        "--registry-address", help="workstation IPv4 address reachable from Talos nodes"
+    )
+    parser.add_argument("--recover", type=Path, help="resume rollback from a local recovery record")
+    parser.add_argument(
+        "--confirm-mirror-quiescent",
+        action="store_true",
+        help="confirm an unacknowledged mirror request can no longer apply",
+    )
+    parser.add_argument(
+        "--confirm-migration-quiescent",
+        action="store_true",
+        help="confirm an unacknowledged migration write can no longer apply",
+    )
+    parser.add_argument("--registry-port", type=int, default=3179)
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply and wait for rollout; default prints the manifest",
+    )
+    global DEPLOYMENT_LOCK
+    args = parser.parse_args()
+    if args.confirm_mirror_quiescent and not args.recover:
+        parser.error("--confirm-mirror-quiescent requires --recover")
+    if args.confirm_migration_quiescent and not args.recover:
+        parser.error("--confirm-migration-quiescent requires --recover")
+    if args.apply or args.recover:
+        directory = ROOT / "build" / "recovery"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (directory / ".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.apply and any(directory.glob("*.json")):
+                raise ValueError(f"unfinished rollback in {directory}; run --recover first")
+            DEPLOYMENT_LOCK = (lock.fileno(),)
+            try:
+                deploy(args, parser)
+            finally:
+                DEPLOYMENT_LOCK = ()
+    else:
+        deploy(args, parser)
+
+
+def deploy(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Dispatch a preview, deployment or recovery under the checkout lock."""
+    if args.recover:
+        if args.apply:
+            parser.error("--recover and --apply are mutually exclusive")
+        info = args.recover.stat()
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            parser.error(
+                "recovery record must be owned by the current user and private (chmod 600)"
+            )
+        recover_record(
+            args.recover,
+            json.loads(args.recover.read_text()),
+            confirm_quiescent=args.confirm_mirror_quiescent,
+            confirm_migration_quiescent=args.confirm_migration_quiescent,
+        )
+        print("Recovery completed", file=sys.stderr)
+        return
+    if not args.endpoint:
+        parser.error("supply --endpoint or TALOS_ENDPOINT with the Talos API endpoint")
+    if not args.image:
+        reference = ROOT / "build/release/image-reference.txt"
+        if not reference.is_file():
+            parser.error("run make build first, or supply --image")
+        args.image = reference.read_text().strip()
+    if not 1 <= args.registry_port <= 65535:
+        parser.error("--registry-port must be between 1 and 65535")
+    if args.migrate_from_namespace == args.namespace:
+        parser.error("migration source and destination namespaces must differ")
+    if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.image):
+        parser.error("--image must be pinned by SHA-256 digest")
+    if args.apply and not args.kube_context:
+        args.kube_context = run(["kubectl", "config", "current-context"]).strip()
+    kube, labels, objects, access_patches, pending_images, verified_nodes = plan(args)
+    manifest = json.dumps({"apiVersion": "v1", "kind": "List", "items": objects})
+    if not args.apply:
+        print(manifest)
+        return
+    check_overlaps(kube, args.namespace, args.migrate_from_namespace, objects[3:], labels)
+    if not namespace_exists(kube, args.namespace):
+        run(kube + ["create", "-f", "-"], json.dumps(objects[0]))
+    stage_images(args, pending_images)
+    for talos, patch, node, machine_id in access_patches:
+        verify_talos_machine(talos, node, machine_id)
+        existing = talos_access(configuration_documents(talos))
+        desired = json.loads(patch)
+        if reader_access(existing, args.namespace) != desired:
+            raise ValueError("Talos API grants changed since preview; rerun deployment")
+        if existing != desired:
+            remove = {
+                "apiVersion": "v1alpha1",
+                "kind": "KubeTalosAPIAccessConfig",
+                "$patch": "delete",
+            }
+            replacement = yaml.safe_dump_all([remove, desired])
+            print(
+                run(talos + ["patch", "machineconfig", "--mode=no-reboot", "--patch", replacement]),
+                end="",
+            )
+            if talos_access(configuration_documents(talos)) != desired:
+                raise ValueError("Talos API access replacement did not match the requested grant")
+    for _ in range(30):
+        crd = subprocess.run(
+            kube + ["get", "crd", "serviceaccounts.talos.dev"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        if crd.returncode == 0:
+            break
+        time.sleep(2)
+    run(
+        kube
+        + ["wait", "--for=condition=Established", "crd/serviceaccounts.talos.dev", "--timeout=45s"]
+    )
+    run(kube + ["apply", "-f", "-"], json.dumps(objects[1]))
+    for _ in range(30):
+        secret = subprocess.run(
+            kube + ["-n", args.namespace, "get", "secret", CREDENTIAL],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        if secret.returncode == 0:
+            break
+        time.sleep(2)
+    run(kube + ["-n", args.namespace, "get", "secret", CREDENTIAL, "-o", "name"])
+    workloads = json.dumps({"apiVersion": "v1", "kind": "List", "items": objects[2:]})
+    run(kube + ["apply", "-f", "-", "--dry-run=server"], workloads)
+    apply_workloads(
+        kube,
+        args.namespace,
+        args.migrate_from_namespace,
+        objects[2],
+        objects[3:],
+        labels,
+        verified_nodes,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        subprocess.SubprocessError,
+        yaml.YAMLError,
+    ) as err:
+        sys.exit(str(err))

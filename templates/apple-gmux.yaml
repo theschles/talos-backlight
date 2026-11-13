@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gmux-backlight
+  namespace: backlight-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gmux-backlight
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gmux-backlight
+    spec:
+      nodeSelector:
+        backlight-class: apple-gmux
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      containers:
+      - name: backlight
+        image: gmux.invalid/controller-inventory:build-required
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: BACKLIGHT_CLASS
+          value: apple-gmux
+        - name: BACKLIGHT_NODE
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          readOnlyRootFilesystem: true
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            memory: 32Mi
+        volumeMounts:
+        - name: defaults
+          mountPath: /etc/backlight
+          readOnly: true
+        - name: panel
+          mountPath: /panel
+          readOnly: true
+        - name: brightness
+          mountPath: /brightness
+        - name: socket
+          mountPath: /run/backlight
+        - name: state
+          mountPath: /state
+      volumes:
+      - name: defaults
+        configMap:
+          name: backlight-defaults
+      - name: panel
+        hostPath:
+          path: /sys/class/backlight/gmux_backlight
+          type: Directory
+      - name: brightness
+        hostPath:
+          path: /sys/class/backlight/gmux_backlight/brightness
+          type: File
+      - name: socket
+        emptyDir:
+          medium: Memory
+      - name: state
+        hostPath:
+          path: /var/lib/gmux-backlight
+          type: DirectoryOrCreate

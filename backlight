@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+parser = argparse.ArgumentParser(
+    description="Control a backlight by Kubernetes node name or inventory nickname."
+)
+parser.add_argument("--kube-context", default=os.environ.get("BACKLIGHT_KUBE_CONTEXT"))
+parser.add_argument(
+    "--namespace", default=os.environ.get("BACKLIGHT_NAMESPACE", "backlight-system")
+)
+parser.add_argument(
+    "--inventory",
+    type=Path,
+    default=Path(
+        os.environ.get("BACKLIGHT_INVENTORY", Path(__file__).resolve().with_name("nodes.json"))
+    ),
+)
+parser.add_argument("node", help="Kubernetes node name, inventory nickname, or all")
+parser.add_argument("command", choices=("status", "on", "off", "set", "percent"))
+parser.add_argument("value", nargs="?")
+args = parser.parse_args()
+if args.command in ("set", "percent"):
+    if args.value is None or not re.fullmatch(r"[0-9]+", args.value):
+        parser.error("brightness must be a nonnegative integer")
+    if args.command == "percent" and (
+        len(args.value.lstrip("0")) > 3 or int(args.value.lstrip("0") or "0") > 100
+    ):
+        parser.error("percentage must be between 0 and 100")
+elif args.value is not None and args.command != "off":
+    parser.error("only off accepts an optional duration")
+if args.node == "all" and (
+    args.command not in ("on", "off", "percent") or args.command == "off" and args.value is not None
+):
+    parser.error("use all with on, off, or percent PERCENT")
+
+kubectl = ["kubectl", "--namespace", args.namespace, "--request-timeout=10s"]
+if args.kube_context:
+    kubectl += ["--context", args.kube_context]
+selector = "app.kubernetes.io/name in (gmux-backlight,dell-backlight)"
+try:
+    pods = json.loads(
+        subprocess.check_output(kubectl + ["get", "pods", "-l", selector, "-o", "json"])
+    )
+    targets: dict[str, list[str]] = {}
+    for pod in pods["items"]:
+        if pod["metadata"].get("deletionTimestamp") or pod["status"].get("phase") != "Running":
+            continue
+        if any(
+            c["name"] == "backlight" and c.get("ready")
+            for c in pod["status"].get("containerStatuses", [])
+        ):
+            targets.setdefault(pod["spec"]["nodeName"], []).append(pod["metadata"]["name"])
+    if args.node == "all":
+        names = sorted(targets)
+    else:
+        name = args.node
+        if name not in targets:
+            inventory = args.inventory
+            matches = (
+                [
+                    node
+                    for node in json.loads(inventory.read_text())["nodes"]
+                    if node.get("nickname") == name
+                ]
+                if inventory.is_file()
+                else []
+            )
+            if matches:
+                if len(matches) != 1:
+                    parser.error(f"duplicate nickname {name}")
+                nodes = json.loads(
+                    subprocess.check_output(kubectl + ["get", "nodes", "-o", "json"])
+                )
+                resolved = [
+                    node["metadata"]["name"]
+                    for node in nodes["items"]
+                    if any(
+                        addr["type"] == "InternalIP" and addr["address"] == matches[0]["ip"]
+                        for addr in node["status"].get("addresses", [])
+                    )
+                ]
+                if len(resolved) != 1:
+                    parser.error(f"expected one Kubernetes node for {matches[0]['ip']}")
+                name = resolved[0]
+        names = [name]
+    if not names:
+        sys.exit("No ready backlight Pods found")
+    failed = False
+    for name in names:
+        candidates = targets.get(name, [])
+        if len(candidates) != 1:
+            print(f"Expected one ready backlight Pod on {name}", file=sys.stderr)
+            failed = True
+            continue
+        if args.node == "all":
+            print(name, flush=True)
+        command = [args.command] if args.value is None else [args.command, args.value]
+        result = subprocess.run(
+            kubectl
+            + ["exec", f"pod/{candidates[0]}", "-c", "backlight", "--", "/backlight"]
+            + command
+        )
+        failed |= result.returncode != 0
+    sys.exit(int(failed))
+except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as err:
+    sys.exit(str(err))

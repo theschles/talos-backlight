@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "ip": "192.0.2.10",
+      "nickname": "laptop-a",
+      "startupPercent": 75,
+      "restoreOnShutdown": {
+        "localShutdown": true,
+        "apiShutdown": true,
+        "apiReboot": true
+      }
+    },
+    {
+      "ip": "192.0.2.11",
+      "nickname": "laptop-b",
+      "classOverride": "intel-edp"
+    }
+  ]
+}
