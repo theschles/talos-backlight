@@ -21,7 +21,7 @@ if Path(sys.argv[0]).name == "talosctl":
         spec = os.environ.get("MACHINE_CONFIG", "apiVersion: v1alpha1\\nkind: MachineConfig\\n")
         print(json.dumps({"metadata":{"id":"v1alpha1"}, "spec":spec}))
     elif "ls" in args:
-        print("192.0.2.10 /sys/class/backlight/gmux_backlight")
+        print(os.environ.get("BACKLIGHT_LISTING", "192.0.2.10 /sys/class/backlight/gmux_backlight"))
     elif args[-1] == "/etc/machine-id":
         print(os.environ.get("TALOS_MACHINE_ID", "a" * 32))
     elif args[-1].endswith("/type"):
@@ -197,6 +197,21 @@ class CLITest(unittest.TestCase):
             "Namespace", {item["kind"] for item in json.loads(preview.stdout)["items"]}
         )
         self.assertFalse(any(set(call) & {"patch", "apply", "delete"} for call in self.calls()))
+
+    def test_preview_explains_empty_and_unsupported_backlight_listings(self) -> None:
+        for listing, expected in (
+            (".", "Talos exposes no backlight devices"),
+            (".\nacpi_video0", "Talos exposes acpi_video0"),
+        ):
+            with self.subTest(listing=listing):
+                self.env["BACKLIGHT_LISTING"] = listing
+                result = self.command(
+                    "deploy-backlight", "--inventory", str(self.inventory), "--image", IMAGE
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertIn("control-plane (192.0.2.10)", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_preview_honors_namespace_and_contexts(self) -> None:
         result = self.command(

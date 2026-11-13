@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Inspect a Talos node's graphics hardware and backlight support."""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from typing import Any
+
+JSONObject = dict[str, Any]
+
+
+def read(command: list[str]) -> str:
+    """Run a bounded, read-only Talos command."""
+    return subprocess.run(command, check=True, capture_output=True, text=True, timeout=20).stdout
+
+
+def resources(raw: str) -> list[JSONObject]:
+    """Decode the stream of JSON objects emitted by talosctl get."""
+    decoder = json.JSONDecoder()
+    result = []
+    raw = raw.strip()
+    while raw:
+        item, end = decoder.raw_decode(raw)
+        result.append(item)
+        raw = raw[end:].lstrip()
+    return result
+
+
+def report(talos: list[str], check_catalog: bool) -> None:
+    """Print node observations and optionally check a documented extension match."""
+    version = read(talos + ["version", "--short"])
+    server = version.partition("Server:")[2]
+    match = re.search(r"(?m)^\s*Tag:\s*(v[0-9]+\.[0-9]+\.[0-9]+)\s*$", server)
+    release = match[1] if match else None
+    print(f"Talos server: {release or server.strip() or 'version unavailable'}")
+    display = [
+        item
+        for item in resources(read(talos + ["get", "pcidevices", "-o", "json"]))
+        if item["spec"]["class_id"].lower().removeprefix("0x") == "03"
+    ]
+    print("PCI display devices:")
+    if not display:
+        print("  None reported")
+    for item in display:
+        spec = item["spec"]
+        print(
+            f"  {item['metadata']['id']} {spec['vendor_id']}:{spec['product_id']} "
+            f"{spec.get('product', 'unknown model')} | driver: {spec.get('driver') or 'unbound'}"
+        )
+
+    installed = {
+        item["spec"]["metadata"]["name"]: item["spec"]["metadata"].get("version", "")
+        for item in resources(read(talos + ["get", "extensions", "-o", "json"]))
+    }
+    print("Installed extensions:")
+    for name, installed_version in sorted(installed.items()):
+        print(f"  {name} {installed_version}".rstrip())
+    if not installed:
+        print("  None reported")
+
+    listing = read(talos + ["ls", "/sys/class/backlight"])
+    interfaces = sorted(
+        {
+            line.split()[-1].rsplit("/", 1)[-1]
+            for line in listing.splitlines()
+            if line.strip() and line.split()[-1] not in (".", "/sys/class/backlight")
+        }
+    )
+    print(f"Backlight interfaces: {', '.join(interfaces) or 'none'}")
+    if interfaces:
+        return
+
+    # Linux i915 lists 8086:5917 in INTEL_KBL_GT2_IDS in include/drm/intel/pciids.h.
+    candidate = "siderolabs/i915"
+    if (
+        not any(
+            item["spec"]["vendor_id"].lower().removeprefix("0x") == "8086"
+            and item["spec"]["product_id"].lower().removeprefix("0x") == "5917"
+            and not item["spec"].get("driver")
+            for item in display
+        )
+        or {"i915", candidate} & installed.keys()
+    ):
+        print("No documented missing extension match for the reported hardware.")
+        return
+    if not check_catalog:
+        print("Rerun with --check-extension-catalog to verify an extension for this Talos release.")
+        return
+    if release is None:
+        print("Extension match unavailable without an exact Talos release.")
+        return
+    url = f"https://factory.talos.dev/version/{release}/extensions/official"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            catalog = json.load(response)
+    except (OSError, ValueError) as err:
+        print(f"Could not verify the official extension catalog: {err}", file=sys.stderr)
+        return
+    if any(entry["name"] == candidate for entry in catalog):
+        print(f"Extension to investigate: {candidate}, listed for Talos {release}.")
+        print(
+            "Verify that the driver binds and exposes the internal panel before enrolling the node."
+        )
+        print(f"Catalog: {url}")
+    else:
+        print(f"The official Talos {release} catalog does not list {candidate}.")
+
+
+def main() -> None:
+    """Resolve Talos options and run the standalone probe."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("node", type=ipaddress.ip_address, help="Talos node IP address")
+    parser.add_argument(
+        "--endpoint", default=os.getenv("CONTROL_PLANE_IP") or os.getenv("TALOS_ENDPOINT")
+    )
+    parser.add_argument("--talosconfig", default=os.getenv("TALOSCONFIG"))
+    parser.add_argument("--talos-context", default=os.getenv("BACKLIGHT_TALOS_CONTEXT"))
+    parser.add_argument(
+        "--check-extension-catalog",
+        action="store_true",
+        help="query the official Image Factory catalog for the node's Talos version",
+    )
+    args = parser.parse_args()
+    talos = ["talosctl", "-n", str(args.node)]
+    for flag, value in (
+        ("-e", args.endpoint),
+        ("--talosconfig", args.talosconfig),
+        ("--context", args.talos_context),
+    ):
+        if value:
+            talos.extend((flag, value))
+    try:
+        report(talos, args.check_extension_catalog)
+    except subprocess.CalledProcessError as err:
+        sys.exit(err.stderr.strip() or str(err))
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as err:
+        sys.exit(f"Probe failed: {err}")
+
+
+if __name__ == "__main__":
+    main()

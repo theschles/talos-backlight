@@ -186,6 +186,12 @@ If a journal is unreadable or its saved brightness no longer fits the panel, sta
 
 On first enrollment, the controller records a valid lit brightness ratio as the normal level before applying startup settings. A dark panel or an existing enrollment without a recorded normal level uses a 75% fallback. The files live under `/var/lib/gmux-backlight/` on each node. Shutdown restoration raises brightness only when it is below the saved normal level. Ordinary Pod termination does not trigger the shutdown policy. Forceful power loss, a disconnected event listener, or failure before the Pod is available can prevent restoration. If the stream disconnects after shutdown or reboot starts, the controller rejects brightness commands until the matching stop event or two minutes after the disconnect, whichever comes first.
 
+## Probe a node
+
+`./probe-backlight NODE_IP` reports the Talos server version, PCI display devices, bound drivers, installed extensions, and backlight interfaces. It uses the same Talos endpoint and context options as deployment and works independently of the inventory.
+
+Add `--check-extension-catalog` to check the public Image Factory catalog for the exact Talos version when the probe recognizes a documented GPU match. The current match covers Intel UHD Graphics 620 with PCI ID `8086:5917`. A catalog match identifies an extension to investigate. Panel control still requires verification on the node.
+
 ## Remove
 
 Restore the panels before removing their controllers.
